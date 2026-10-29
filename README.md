@@ -85,21 +85,58 @@ YANDEX_CLIENT_ID=<ClientID собственного приложения>
 YANDEX_EXPIRES_IN=<реальный expires_in, если выдан>
 ```
 
-Не помещайте токен в argv, чат или Git. На хосте есть вспомогательный stdlib tool:
+Не помещайте токен в argv, чат или Git. Оба input-файла должны быть regular
+owner-only (mode600), не symlinks. Helper не ослабляет права файлов. Для уже
+существующего root-owned `rclone.conf` пользователь UID1000 не сможет прочитать
+его обычным `python3`. Используйте следующий привилегированный workflow на хосте:
+исходный token-файл остаётся у владельца mode600, а его временная копия и
+проверенная версия helper помещаются в **новый** root-owned каталог mode700.
+Не продолжайте, если `mkdir` сообщает, что каталог уже существует.
 
 ```sh
-python3 tools/update_oauth.py --config /private/rclone.conf --token-file /private/new-oauth.env
+chmod 600 /private/new-oauth.env
+sudo mkdir -m 700 /run/yandex-oauth-update
+sudo install -o root -g root -m 600 -- tools/update_oauth.py /run/yandex-oauth-update/update_oauth.py
+sudo install -o root -g root -m 600 -- /private/new-oauth.env /run/yandex-oauth-update/new-oauth.env
+sudo python3 -I /run/yandex-oauth-update/update_oauth.py --config /private/rclone.conf --token-file /run/yandex-oauth-update/new-oauth.env
 ```
 
-Без `--apply` он выполняет только два GET: сведения о Диске и metadata корня.
-Он отвергает redirects и не передаёт OAuth header другому хосту. Не печатает
-credential/response body. Оба файла должны быть regular owner-only, не symlinks.
+Замените `/private/...` настоящими локальными путями, не значениями credentials.
+`python3 -I` исключает пользовательские Python paths/environment; root запускает
+только staged копию проверенного helper, которую обычный пользователь не меняет.
+
+Успешная проверка выполняет **три read-only GET**: сведения `/disk` старым токеном,
+затем сведения `/disk` и metadata корня новым. Непустой стабильный `user.uid` должен
+быть строкой десятичных цифр и строго совпадать у обоих токенов. Другой аккаунт,
+отсутствующая/некорректная identity или недоступные старые сведения блокируют замену
+**до создания backup**. Старый `/resources` не запрашивается: его 410 не мешает,
+если старый `/disk` подтверждает аккаунт. При недоступности старой identity
+остановитесь и разберите её отдельно; helper не поддерживает обход этой проверки.
+Redirects отвергаются, OAuth header не передаётся другому хосту, credentials и
+response body не печатаются. Без `--apply` конфигурация и backup-файлы не меняются.
 
 Для применения сначала остановите **только main backup**, чтобы refresh rclone не
-соревновался с заменой файла. Добавьте `--apply`: перед заменой создаётся приватная
+соревновался с заменой файла. После успешной проверки выполните:
+
+```sh
+docker compose stop main
+sudo python3 -I /run/yandex-oauth-update/update_oauth.py --config /private/rclone.conf --token-file /run/yandex-oauth-update/new-oauth.env --apply
+```
+
+Доступ проверяется повторно. Перед заменой создаётся приватная
 точная копия, сохраняются uid/gid и mode 600; меняется только выбранный remote.
 Старые refresh_token/client_secret не переносятся к новому приложению. Если время
 истечения не выдано, helper его не выдумывает; сервер остаётся источником истины.
+
+По окончании или при отказе удалите временную копию token и staged helper:
+
+```sh
+sudo rm -f -- /run/yandex-oauth-update/new-oauth.env /run/yandex-oauth-update/update_oauth.py
+sudo rmdir /run/yandex-oauth-update
+```
+
+Исходный token-файл и резервная копия конфигурации остаются private; удаляйте их
+только по своей политике хранения. Не делайте config/token group/world-readable.
 
 После замены проверьте root listing и download/check небольшого известного файла
 в **отдельный** каталог, затем запускайте main. Зафиксируйте настоящий успешный
@@ -111,6 +148,7 @@ credential/response body. Оба файла должны быть regular owner-
 ```sh
 python3 -W error::ResourceWarning -m unittest discover -s tests -v
 YDB_SHELL_TEST_IMAGE=ghcr.io/rclone/rclone:1.75.2 python3 -m unittest discover -s tests -v
+YDB_TEST_PRIVILEGED_STAGING=1 python3 -m unittest discover -s tests -v
 sh -n scripts/run-loop.sh
 sh -n scripts/healthcheck.sh
 ```
@@ -120,5 +158,10 @@ Shell tests запускают настоящий entrypoint с fake rclone/find
 `--network none`, без рабочих mounts/credentials. OAuth HTTP boundary подменён.
 Проверяются частичные ошибки cleanup, ложный success, 410/403, deadlines, stop,
 health freshness, сохранение старой конфигурации и безопасная замена нового token.
+Опциональная privileged staging проверка требует `sudo -n`, создаёт только
+synthetic root-owned mode600 config/token в отдельном `/run/ydb-oauth-test-*`
+каталоге mode700 и запускает staged helper через `sudo python3 -I` с подменённым
+HTTP boundary. Она проверяет read-only/apply, uid/gid/mode и exact private backup,
+затем удаляет synthetic каталог. Настоящие credentials/API не используются.
 
 Общий проектный план и восстановление — в [PLAN.md](PLAN.md).

@@ -75,32 +75,50 @@ def read_token_file(path: Path) -> dict[str, str]:
     return values
 
 
-def validate_access(token: str) -> None:
+def get_metadata(token: str, directory: bool = False) -> dict:
     opener = urllib.request.build_opener(NoRedirect())
-    for endpoint, directory in (
-        ("https://cloud-api.yandex.net/v1/disk", False),
-        ("https://cloud-api.yandex.net/v1/disk/resources?path=disk%3A%2F&limit=0", True),
-    ):
-        request = urllib.request.Request(endpoint, headers={"Authorization": "OAuth " + token})
-        try:
-            with opener.open(request, timeout=20) as response:
-                if response.status != 200:
-                    raise AccessError(response.status)
-                body = response.read(1048577)
-                data = json.loads(body)
-                if len(body) > 1048576 or not isinstance(data, dict) or "error" in data:
+    endpoint = "https://cloud-api.yandex.net/v1/disk"
+    if directory:
+        endpoint += "/resources?path=disk%3A%2F&limit=0"
+    request = urllib.request.Request(endpoint, headers={"Authorization": "OAuth " + token})
+    try:
+        with opener.open(request, timeout=20) as response:
+            if response.status != 200:
+                raise AccessError(response.status)
+            body = response.read(1048577)
+            data = json.loads(body)
+            if len(body) > 1048576 or not isinstance(data, dict) or "error" in data:
+                raise AccessError()
+            if directory:
+                embedded = data.get("_embedded")
+                if data.get("type") != "dir" or not isinstance(embedded, dict) or not isinstance(embedded.get("items"), list):
                     raise AccessError()
-                if directory:
-                    embedded = data.get("_embedded")
-                    if data.get("type") != "dir" or not isinstance(embedded, dict) or not isinstance(embedded.get("items"), list):
-                        raise AccessError()
-                elif not isinstance(data.get("total_space"), int) or not isinstance(data.get("used_space"), int):
-                    raise AccessError()
-        except urllib.error.HTTPError as error:
-            # Do not include the response body, URL, headers or token in errors.
-            raise AccessError(error.code) from None
-        except (urllib.error.URLError, TimeoutError, ValueError):
-            raise AccessError() from None
+            elif type(data.get("total_space")) is not int or type(data.get("used_space")) is not int:
+                raise AccessError()
+            return data
+    except urllib.error.HTTPError as error:
+        # Do not include the response body, URL, headers or token in errors.
+        status = error.code
+        error.close()
+        raise AccessError(status) from None
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        raise AccessError() from None
+
+
+def get_account_uid(token: str) -> str:
+    user = get_metadata(token).get("user")
+    uid = user.get("uid") if isinstance(user, dict) else None
+    # Disk's stable uid is a decimal string. Do not coerce numbers, booleans,
+    # empty values or display names into an account identity.
+    if not isinstance(uid, str) or not re.fullmatch(r"[0-9]{1,128}", uid):
+        raise AccessError()
+    return uid
+
+
+def validate_access(token: str) -> str:
+    uid = get_account_uid(token)
+    get_metadata(token, directory=True)
+    return uid
 
 
 def update_configuration(config_path: Path, remote: str, values: dict[str, str], apply: bool) -> dict:
@@ -111,9 +129,22 @@ def update_configuration(config_path: Path, remote: str, values: dict[str, str],
     configuration.read_string(original.decode("utf-8"))
     if remote not in configuration or configuration[remote].get("type") != "yandex":
         raise ConfigurationError("Selected remote must already be type=yandex")
-    validate_access(values["YANDEX_ACCESS_TOKEN"])
+    try:
+        old_token = json.loads(configuration[remote].get("token", ""))
+    except ValueError:
+        raise ConfigurationError("Selected remote must contain a valid token") from None
+    old_access = old_token.get("access_token") if isinstance(old_token, dict) else None
+    if not isinstance(old_access, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,4096}", old_access):
+        raise ConfigurationError("Selected remote must contain a valid access token")
+    # The old account may still expose /disk identity while /resources is 410.
+    # Never request its root; require the new token to refer to this same account
+    # before creating even a backup or a replacement configuration file.
+    old_uid = get_account_uid(old_access)
+    new_uid = validate_access(values["YANDEX_ACCESS_TOKEN"])
+    if new_uid != old_uid:
+        raise AccessError()
     if not apply:
-        return {"ok": True, "read_only_api_checks": 2, "configuration_changed": False}
+        return {"ok": True, "read_only_api_checks": 3, "configuration_changed": False}
     token = {"access_token": values["YANDEX_ACCESS_TOKEN"], "token_type": "OAuth"}
     if "YANDEX_EXPIRES_IN" in values:
         expires = datetime.now(timezone.utc) + timedelta(seconds=int(values["YANDEX_EXPIRES_IN"]))
@@ -157,7 +188,7 @@ def update_configuration(config_path: Path, remote: str, values: dict[str, str],
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
-    return {"ok": True, "read_only_api_checks": 2, "configuration_changed": True, "private_backup": str(backup)}
+    return {"ok": True, "read_only_api_checks": 3, "configuration_changed": True, "private_backup": str(backup)}
 
 
 def main(argv=None) -> int:
@@ -165,7 +196,7 @@ def main(argv=None) -> int:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--token-file", type=Path, required=True)
     parser.add_argument("--remote", default="yandex_main")
-    parser.add_argument("--apply", action="store_true", help="replace configuration after both read-only API checks")
+    parser.add_argument("--apply", action="store_true", help="replace configuration after read-only access and same-account checks")
     args = parser.parse_args(argv)
     try:
         result = update_configuration(args.config, args.remote, read_token_file(args.token_file), args.apply)

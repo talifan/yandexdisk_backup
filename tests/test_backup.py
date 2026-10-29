@@ -2,6 +2,8 @@
 
 Set YDB_SHELL_TEST_IMAGE to the pinned runtime image to repeat shell cases in
 BusyBox with --network none. Python helper cases always mock the HTTP boundary.
+Set YDB_TEST_PRIVILEGED_STAGING=1 to test the documented root-only staging with
+sudo -n and synthetic files; no real credentials or network are used.
 """
 import configparser
 import contextlib
@@ -270,20 +272,53 @@ class OAuthTests(unittest.TestCase):
         self.token = self.root / "new-oauth.env"
         self.token.write_text("YANDEX_ACCESS_TOKEN=synthetic_new_token_123456789\nYANDEX_CLIENT_ID=synthetic_client_123456789\nYANDEX_EXPIRES_IN=3600\n")
         self.token.chmod(0o600)
+        self.old_metadata = {"total_space": 1000, "used_space": 1, "user": {"uid": "111"}}
+        self.new_metadata = {"total_space": 1000, "used_space": 1, "user": {"uid": "111"}}
+        self.old_status = 200
+        self.root_status = 200
+        self.requests = []
+        self.opener = Mock()
+        self.opener.open.side_effect = self.open_api
+
+    def open_api(self, request, timeout):
+        self.assertEqual(request.get_method(), "GET")
+        self.assertEqual(timeout, 20)
+        old = request.get_header("Authorization") == "OAuth old-test-token"
+        root = "/resources?" in request.full_url
+        self.requests.append(("old" if old else "new", "root" if root else "disk"))
+        # Simulate the real failure: old /disk works but old /resources is 410.
+        status = (410 if old else self.root_status) if root else (self.old_status if old else 200)
+        if status != 200:
+            raise urllib.error.HTTPError(request.full_url, status, "synthetic denial", {}, None)
+        payload = ({"type": "dir", "_embedded": {"items": []}} if root
+                   else self.old_metadata if old else self.new_metadata)
+        response = Mock()
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=None)
+        response.status = 200
+        response.read.return_value = json.dumps(payload).encode()
+        return response
+
+    def assert_unchanged_without_backup(self):
+        self.assertEqual(self.config.read_text(), self.original)
+        self.assertEqual(list(self.root.glob("rclone.conf.before-oauth-*")), [])
+        self.assertEqual(list(self.root.glob(".oauth-update-*")), [])
 
     def test_read_only_check_does_not_change_configuration(self):
         values = self.module.read_token_file(self.token)
-        with patch.object(self.module, "validate_access") as probe:
+        with patch.object(self.module.urllib.request, "build_opener", return_value=self.opener):
             result = self.module.update_configuration(self.config, "yandex_main", values, False)
-        probe.assert_called_once_with(values["YANDEX_ACCESS_TOKEN"])
         self.assertFalse(result["configuration_changed"])
-        self.assertEqual(self.config.read_text(), self.original)
-        self.assertEqual(len(list(self.root.glob("rclone.conf.before-oauth-*"))), 0)
+        self.assertEqual(result["read_only_api_checks"], 3)
+        self.assertEqual(self.requests, [("old", "disk"), ("new", "disk"), ("new", "root")])
+        self.assert_unchanged_without_backup()
 
-    def test_apply_is_atomic_preserves_other_remote_and_makes_private_exact_backup(self):
+    def test_same_account_apply_with_old_root_410_is_atomic_and_preserves_other_remote(self):
         values = self.module.read_token_file(self.token)
-        with patch.object(self.module, "validate_access"):
+        with patch.object(self.module.urllib.request, "build_opener", return_value=self.opener):
             result = self.module.update_configuration(self.config, "yandex_main", values, True)
+        self.assertEqual(self.requests, [("old", "disk"), ("new", "disk"), ("new", "root")])
+        self.assertEqual(result["read_only_api_checks"], 3)
         configuration = configparser.RawConfigParser()
         configuration.read(self.config)
         self.assertEqual(configuration["secondary"]["type"], "local")
@@ -300,17 +335,70 @@ class OAuthTests(unittest.TestCase):
         self.assertEqual(self.config.stat().st_mode & 0o777, 0o600)
 
     def test_failed_root_listing_keeps_old_credentials_and_does_not_echo_secret(self):
-        with patch.object(self.module, "validate_access", side_effect=self.module.AccessError(410)):
+        self.root_status = 410
+        with patch.object(self.module.urllib.request, "build_opener", return_value=self.opener):
             with contextlib.redirect_stdout(io.StringIO()) as output:
                 result = self.module.main(["--config", str(self.config), "--token-file", str(self.token), "--apply"])
         self.assertEqual(result, 1)
-        self.assertEqual(self.config.read_text(), self.original)
+        self.assert_unchanged_without_backup()
         self.assertIn('"http_status": 410', output.getvalue())
         self.assertNotIn("synthetic_new_token", output.getvalue())
+        self.assertNotIn("old-test-token", output.getvalue())
+
+    def test_different_account_is_rejected_before_backup_in_check_and_apply(self):
+        self.new_metadata["user"]["uid"] = "222"
+        for apply in (False, True):
+            with self.subTest(apply=apply), patch.object(self.module.urllib.request, "build_opener", return_value=self.opener):
+                with contextlib.redirect_stdout(io.StringIO()) as output:
+                    args = ["--config", str(self.config), "--token-file", str(self.token)]
+                    result = self.module.main(args + (["--apply"] if apply else []))
+            self.assertEqual(result, 1)
+            self.assert_unchanged_without_backup()
+            for private_value in ("old-test-token", "synthetic_new_token", '"111"', '"222"'):
+                self.assertNotIn(private_value, output.getvalue())
+
+    def test_missing_and_malformed_old_or_new_uid_are_rejected_without_backup(self):
+        values = self.module.read_token_file(self.token)
+        for side in ("old_metadata", "new_metadata"):
+            for user in (None, {}, {"uid": ""}, {"uid": " "}, {"uid": 111}, {"uid": True},
+                         {"uid": []}, {"uid": {}}, {"uid": "display-name"}, {"uid": "1" * 129}):
+                with self.subTest(side=side, user=user):
+                    self.old_metadata["user"] = {"uid": "111"}
+                    self.new_metadata["user"] = {"uid": "111"}
+                    getattr(self, side)["user"] = user
+                    with patch.object(self.module.urllib.request, "build_opener", return_value=self.opener):
+                        with self.assertRaises(self.module.AccessError):
+                            self.module.update_configuration(self.config, "yandex_main", values, True)
+                    self.assert_unchanged_without_backup()
+
+    def test_old_metadata_denial_cannot_replace_credentials(self):
+        values = self.module.read_token_file(self.token)
+        for status in (401, 403, 410):
+            with self.subTest(status=status):
+                self.old_status = status
+                self.requests.clear()
+                with patch.object(self.module.urllib.request, "build_opener", return_value=self.opener):
+                    with self.assertRaises(self.module.AccessError):
+                        self.module.update_configuration(self.config, "yandex_main", values, True)
+                self.assertEqual(self.requests, [("old", "disk")])
+                self.assert_unchanged_without_backup()
+
+    def test_invalid_existing_token_is_rejected_before_api_or_backup(self):
+        values = self.module.read_token_file(self.token)
+        for old in ("not-json", "[]", '{}', '{"access_token": 111}', '{"access_token": ""}',
+                    '{"access_token": "invalid token"}'):
+            with self.subTest(old=old):
+                self.original = "[yandex_main]\ntype = yandex\ntoken = " + old + "\n"
+                self.config.write_text(self.original)
+                with patch.object(self.module.urllib.request, "build_opener", return_value=self.opener):
+                    with self.assertRaises(self.module.ConfigurationError):
+                        self.module.update_configuration(self.config, "yandex_main", values, True)
+                self.assertEqual(self.requests, [])
+                self.assert_unchanged_without_backup()
 
     def test_failed_atomic_replace_preserves_old_file_and_cleans_temporary_secret(self):
         values = self.module.read_token_file(self.token)
-        with patch.object(self.module, "validate_access"), patch.object(self.module.os, "replace", side_effect=OSError("synthetic replace failure")):
+        with patch.object(self.module.urllib.request, "build_opener", return_value=self.opener), patch.object(self.module.os, "replace", side_effect=OSError("synthetic replace failure")):
             with self.assertRaises(OSError):
                 self.module.update_configuration(self.config, "yandex_main", values, True)
         self.assertEqual(self.config.read_text(), self.original)
@@ -341,11 +429,11 @@ class OAuthTests(unittest.TestCase):
         response.__enter__ = Mock(return_value=response)
         response.__exit__ = Mock(return_value=None)
         response.status = 200
-        response.read.side_effect = [b'{"total_space": 1000, "used_space": 1}', b'{"type":"dir","_embedded":{"items":[]}}']
+        response.read.side_effect = [b'{"total_space": 1000, "used_space": 1, "user":{"uid":"111"}}', b'{"type":"dir","_embedded":{"items":[]}}']
         opener = Mock()
         opener.open.return_value = response
         with patch.object(self.module.urllib.request, "build_opener", return_value=opener) as builder:
-            self.module.validate_access("synthetic_token")
+            self.assertEqual(self.module.validate_access("synthetic_token"), "111")
         self.assertIsInstance(builder.call_args.args[0], self.module.NoRedirect)
         self.assertEqual(opener.open.call_count, 2)
         for call in opener.open.call_args_list:
@@ -360,12 +448,77 @@ class OAuthTests(unittest.TestCase):
         response.__enter__ = Mock(return_value=response)
         response.__exit__ = Mock(return_value=None)
         response.status = 200
-        response.read.side_effect = [b'{"total_space":1000,"used_space":1}', b'{}']
+        response.read.side_effect = [b'{"total_space":1000,"used_space":1,"user":{"uid":"111"}}', b'{}']
         opener = Mock()
         opener.open.return_value = response
         with patch.object(self.module.urllib.request, "build_opener", return_value=opener):
             with self.assertRaises(self.module.AccessError):
                 self.module.validate_access("synthetic_token")
+
+    @unittest.skipUnless(os.environ.get("YDB_TEST_PRIVILEGED_STAGING") == "1", "privileged staging QA is opt-in")
+    def test_documented_root_staging_contract_without_network(self):
+        stage = Path("/run") / ("ydb-oauth-test-" + uuid.uuid4().hex)
+        subprocess.run(["sudo", "-n", "mkdir", "-m", "700", str(stage)], check=True, capture_output=True)
+        self.addCleanup(lambda: subprocess.run(["sudo", "-n", "rm", "-rf", "--", str(stage)], check=True, capture_output=True))
+        probe = self.root / "staging_probe.py"
+        probe.write_text('''import contextlib
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import sys
+from unittest.mock import patch
+
+stage = Path(__file__).parent
+assert os.geteuid() == 0 and sys.flags.isolated == 1
+assert stage.stat().st_uid == 0 and stage.stat().st_mode & 0o777 == 0o700
+for name in ("rclone.conf", "new-oauth.env", "update_oauth.py"):
+    info = (stage / name).stat()
+    assert info.st_uid == info.st_gid == 0 and info.st_mode & 0o777 == 0o600
+spec = importlib.util.spec_from_file_location("staged_oauth", stage / "update_oauth.py")
+helper = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(helper)
+original = (stage / "rclone.conf").read_bytes()
+calls = []
+class Response:
+    status = 200
+    def __init__(self, payload): self.payload = payload
+    def __enter__(self): return self
+    def __exit__(self, *args): return False
+    def read(self, limit): return json.dumps(self.payload).encode()[:limit]
+class API:
+    def open(self, request, timeout):
+        assert request.get_method() == "GET" and timeout == 20
+        assert request.full_url.startswith("https://cloud-api.yandex.net/v1/disk")
+        old = request.get_header("Authorization") == "OAuth old-test-token"
+        root = "/resources?" in request.full_url
+        assert not (old and root)
+        calls.append((old, root))
+        return Response({"type":"dir", "_embedded":{"items":[]}} if root else
+                        {"total_space":1000, "used_space":1, "user":{"uid":"111"}})
+args = ["--config", str(stage / "rclone.conf"), "--token-file", str(stage / "new-oauth.env")]
+output = io.StringIO()
+with patch.object(helper.urllib.request, "build_opener", return_value=API()), contextlib.redirect_stdout(output):
+    assert helper.main(args) == 0
+    assert (stage / "rclone.conf").read_bytes() == original
+    assert list(stage.glob("rclone.conf.before-oauth-*")) == []
+    assert helper.main(args + ["--apply"]) == 0
+assert len(calls) == 6
+backup, = stage.glob("rclone.conf.before-oauth-*")
+assert backup.read_bytes() == original
+for path in (stage / "rclone.conf", backup):
+    info = path.stat()
+    assert info.st_uid == info.st_gid == 0 and info.st_mode & 0o777 == 0o600
+assert "synthetic_new_token" not in output.getvalue() and "old-test-token" not in output.getvalue()
+print("privileged_staging_pass")
+''')
+        for source, name in ((self.config, "rclone.conf"), (self.token, "new-oauth.env"),
+                             (ROOT / "tools" / "update_oauth.py", "update_oauth.py"), (probe, "staging_probe.py")):
+            subprocess.run(["sudo", "-n", "install", "-o", "root", "-g", "root", "-m", "600", "--", str(source), str(stage / name)], check=True, capture_output=True)
+        result = subprocess.run(["sudo", "-n", "python3", "-I", str(stage / "staging_probe.py")], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.strip(), "privileged_staging_pass")
 
 
 if __name__ == "__main__":
