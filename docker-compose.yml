@@ -11,6 +11,12 @@ x-backup-common: &backup-common
   stop_grace_period: 2m
   cap_drop:
     - ALL
+  healthcheck:
+    test: ["CMD", "/bin/sh", "/opt/yandex-backup/healthcheck.sh"]
+    interval: 1m
+    timeout: 10s
+    retries: 1
+    start_period: 30s
   logging:
     driver: json-file
     options:
@@ -22,19 +28,24 @@ services:
     <<: *backup-common
     container_name: yandexdisk-backup-main
     environment:
-      INTERVAL_SECONDS: "1800"
-      RETENTION_DAYS: "180"
+      INTERVAL_SECONDS: ${INTERVAL_SECONDS:-1800}
+      RETENTION_DAYS: ${RETENTION_DAYS:-180}
       MAX_DELETE: "10000"
-      MAX_DELETE_SIZE: 200Gi
+      MAX_DELETE_SIZE: ${MAX_DELETE_SIZE:-200Gi}
+      HEALTH_MAX_AGE_SECONDS: ${HEALTH_MAX_AGE_SECONDS:-3900}
+      PREFLIGHT_TIMEOUT_SECONDS: ${PREFLIGHT_TIMEOUT_SECONDS:-90}
+      MAX_RUN_SECONDS: ${MAX_RUN_SECONDS:-43200}
+      RETRY_INITIAL_SECONDS: ${RETRY_INITIAL_SECONDS:-300}
+      RETRY_MAX_SECONDS: ${RETRY_MAX_SECONDS:-21600}
+      EXPECTED_FS_MAGIC: ${EXPECTED_FS_MAGIC:-6969}
       RCLONE_CONFIG: /config/rclone.conf
       REMOTE_NAME: yandex_main
       ACCOUNT_NAME: main
       TZ: ${TZ:-UTC}
     volumes:
-      - ./scripts/run-loop.sh:/opt/yandex-backup/run-loop.sh:ro
+      - ./scripts:/opt/yandex-backup:ro
       - ${BACKUP_DATA_DIR:?Set BACKUP_DATA_DIR in .env}/config:/config
       - ${BACKUP_DATA_DIR:?Set BACKUP_DATA_DIR in .env}/state/main:/state
-      - ${BACKUP_DATA_DIR:?Set BACKUP_DATA_DIR in .env}/logs/main:/logs
       - ${MAIN_BACKUP_DIR:?Set MAIN_BACKUP_DIR in .env}:/backup
       - ${MAIN_VERSIONS_DIR:?Set MAIN_VERSIONS_DIR in .env}:/versions
 
@@ -43,18 +54,23 @@ services:
     profiles: ["secondary"]
     container_name: yandexdisk-backup-secondary
     environment:
-      INTERVAL_SECONDS: "1800"
-      RETENTION_DAYS: "180"
+      INTERVAL_SECONDS: ${INTERVAL_SECONDS:-1800}
+      RETENTION_DAYS: ${RETENTION_DAYS:-180}
       MAX_DELETE: "10000"
-      MAX_DELETE_SIZE: 200Gi
+      MAX_DELETE_SIZE: ${MAX_DELETE_SIZE:-200Gi}
+      HEALTH_MAX_AGE_SECONDS: ${HEALTH_MAX_AGE_SECONDS:-3900}
+      PREFLIGHT_TIMEOUT_SECONDS: ${PREFLIGHT_TIMEOUT_SECONDS:-90}
+      MAX_RUN_SECONDS: ${MAX_RUN_SECONDS:-43200}
+      RETRY_INITIAL_SECONDS: ${RETRY_INITIAL_SECONDS:-300}
+      RETRY_MAX_SECONDS: ${RETRY_MAX_SECONDS:-21600}
+      EXPECTED_FS_MAGIC: ${EXPECTED_FS_MAGIC:-6969}
       RCLONE_CONFIG: /config/rclone.conf
       REMOTE_NAME: yandex_secondary
       ACCOUNT_NAME: secondary
       TZ: ${TZ:-UTC}
     volumes:
-      - ./scripts/run-loop.sh:/opt/yandex-backup/run-loop.sh:ro
+      - ./scripts:/opt/yandex-backup:ro
       - ${BACKUP_DATA_DIR:?Set BACKUP_DATA_DIR in .env}/config:/config
       - ${BACKUP_DATA_DIR:?Set BACKUP_DATA_DIR in .env}/state/secondary:/state
-      - ${BACKUP_DATA_DIR:?Set BACKUP_DATA_DIR in .env}/logs/secondary:/logs
       - ${SECONDARY_BACKUP_DIR:?Set SECONDARY_BACKUP_DIR in .env}:/backup
       - ${SECONDARY_VERSIONS_DIR:?Set SECONDARY_VERSIONS_DIR in .env}:/versions

@@ -16,3 +16,8 @@ rclone.conf.*
 *credentials*
 *.token
 *.pre-maintenance-*
+
+# Owner-provided OAuth inputs and atomic update remnants
+*.env
+.oauth-update-*
+*.before-oauth-*
