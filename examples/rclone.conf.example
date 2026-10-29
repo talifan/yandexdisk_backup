@@ -1,0 +1,7 @@
+# Structural template only; authorize read-only remotes locally.
+# Keep the resulting credential-bearing rclone.conf outside Git.
+[yandex_main]
+type = yandex
+
+[yandex_secondary]
+type = yandex

@@ -1,0 +1,18 @@
+# Local credentials and runtime data
+.env
+.env.*
+!.env.example
+config/
+logs/
+state/
+backup/
+backups/
+versions/
+data/
+*.log
+rclone.conf
+rclone.conf.*
+!examples/rclone.conf.example
+*credentials*
+*.token
+*.pre-maintenance-*

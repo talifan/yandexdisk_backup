@@ -1,0 +1,60 @@
+name: yandexdisk-backup
+
+x-backup-common: &backup-common
+  image: ghcr.io/rclone/rclone:1.75.2@sha256:2687085f718d3c628f7fdfb77c52a1d344332aed543110bb88088f2c70d43eb5
+  restart: unless-stopped
+  entrypoint: ["/bin/sh", "/opt/yandex-backup/run-loop.sh"]
+  cpus: 1.0
+  mem_limit: 768m
+  memswap_limit: 768m
+  pids_limit: 128
+  stop_grace_period: 2m
+  cap_drop:
+    - ALL
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+
+services:
+  main:
+    <<: *backup-common
+    container_name: yandexdisk-backup-main
+    environment:
+      INTERVAL_SECONDS: "1800"
+      RETENTION_DAYS: "180"
+      MAX_DELETE: "10000"
+      MAX_DELETE_SIZE: 200Gi
+      RCLONE_CONFIG: /config/rclone.conf
+      REMOTE_NAME: yandex_main
+      ACCOUNT_NAME: main
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ./scripts/run-loop.sh:/opt/yandex-backup/run-loop.sh:ro
+      - ${BACKUP_DATA_DIR:?Set BACKUP_DATA_DIR in .env}/config:/config
+      - ${BACKUP_DATA_DIR:?Set BACKUP_DATA_DIR in .env}/state/main:/state
+      - ${BACKUP_DATA_DIR:?Set BACKUP_DATA_DIR in .env}/logs/main:/logs
+      - ${MAIN_BACKUP_DIR:?Set MAIN_BACKUP_DIR in .env}:/backup
+      - ${MAIN_VERSIONS_DIR:?Set MAIN_VERSIONS_DIR in .env}:/versions
+
+  secondary:
+    <<: *backup-common
+    profiles: ["secondary"]
+    container_name: yandexdisk-backup-secondary
+    environment:
+      INTERVAL_SECONDS: "1800"
+      RETENTION_DAYS: "180"
+      MAX_DELETE: "10000"
+      MAX_DELETE_SIZE: 200Gi
+      RCLONE_CONFIG: /config/rclone.conf
+      REMOTE_NAME: yandex_secondary
+      ACCOUNT_NAME: secondary
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ./scripts/run-loop.sh:/opt/yandex-backup/run-loop.sh:ro
+      - ${BACKUP_DATA_DIR:?Set BACKUP_DATA_DIR in .env}/config:/config
+      - ${BACKUP_DATA_DIR:?Set BACKUP_DATA_DIR in .env}/state/secondary:/state
+      - ${BACKUP_DATA_DIR:?Set BACKUP_DATA_DIR in .env}/logs/secondary:/logs
+      - ${SECONDARY_BACKUP_DIR:?Set SECONDARY_BACKUP_DIR in .env}:/backup
+      - ${SECONDARY_VERSIONS_DIR:?Set SECONDARY_VERSIONS_DIR in .env}:/versions
