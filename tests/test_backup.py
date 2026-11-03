@@ -270,7 +270,7 @@ class OAuthTests(unittest.TestCase):
         self.config.write_text(self.original)
         self.config.chmod(0o600)
         self.token = self.root / "new-oauth.env"
-        self.token.write_text("YANDEX_ACCESS_TOKEN=synthetic_new_token_123456789\nYANDEX_CLIENT_ID=synthetic_client_123456789\nYANDEX_EXPIRES_IN=3600\n")
+        self.token.write_text("YANDEX_ACCESS_TOKEN=synthetic_new_token_123456789\nYANDEX_CLIENT_ID=synthetic_client_123456789\nYANDEX_EXPIRES_IN=3600\nYANDEX_REFRESH_TOKEN=synthetic_refresh_token_123456789\nYANDEX_CLIENT_SECRET=synthetic_client_secret_123456789\n")
         self.token.chmod(0o600)
         self.old_metadata = {"total_space": 1000, "used_space": 1, "user": {"uid": "111"}}
         self.new_metadata = {"total_space": 1000, "used_space": 1, "user": {"uid": "111"}}
@@ -322,9 +322,10 @@ class OAuthTests(unittest.TestCase):
         configuration = configparser.RawConfigParser()
         configuration.read(self.config)
         self.assertEqual(configuration["secondary"]["type"], "local")
-        self.assertNotIn("client_secret", configuration["yandex_main"])
+        self.assertEqual(configuration["yandex_main"]["client_secret"], values["YANDEX_CLIENT_SECRET"])
         token = json.loads(configuration["yandex_main"]["token"])
-        self.assertNotIn("refresh_token", token)
+        self.assertEqual(token["refresh_token"], values["YANDEX_REFRESH_TOKEN"])
+        self.assertNotEqual(token["refresh_token"], "old-refresh")
         self.assertEqual(token["access_token"], values["YANDEX_ACCESS_TOKEN"])
         self.assertEqual(configuration["yandex_main"]["client_id"], values["YANDEX_CLIENT_ID"])
         expiry = datetime.fromisoformat(token["expiry"].replace("Z", "+00:00"))
@@ -423,6 +424,34 @@ class OAuthTests(unittest.TestCase):
             self.token.write_text(original + extra + "\n")
             with self.assertRaises(self.module.ConfigurationError):
                 self.module.read_token_file(self.token)
+
+    def test_access_only_or_incomplete_refresh_credentials_never_change_config(self):
+        original = self.token.read_text()
+        for missing in ("YANDEX_REFRESH_TOKEN", "YANDEX_CLIENT_SECRET", "YANDEX_EXPIRES_IN"):
+            with self.subTest(missing=missing):
+                self.token.write_text("\n".join(line for line in original.splitlines()
+                                                if not line.startswith(missing + "=")) + "\n")
+                with patch.object(self.module.urllib.request, "build_opener", return_value=self.opener):
+                    with contextlib.redirect_stdout(io.StringIO()) as output:
+                        result = self.module.main(["--config", str(self.config), "--token-file", str(self.token), "--apply"])
+                self.assertEqual(result, 1)
+                self.assertEqual(self.requests, [])
+                self.assert_unchanged_without_backup()
+                self.assertNotIn("synthetic_", output.getvalue())
+
+    def test_invalid_expiry_or_refresh_credentials_fail_before_api(self):
+        original = self.token.read_text()
+        cases = [("YANDEX_EXPIRES_IN", value) for value in ("0", "-1", "not-a-number", "999999999999")]
+        cases += [("YANDEX_REFRESH_TOKEN", value) for value in ("", "too-short", "refresh token with whitespace")]
+        cases += [("YANDEX_CLIENT_SECRET", value) for value in ("", "too-short", "invalid secret with whitespace")]
+        for key, value in cases:
+            with self.subTest(key=key, value=value):
+                self.token.write_text("\n".join(key + "=" + value if line.startswith(key + "=") else line
+                                                for line in original.splitlines()) + "\n")
+                with self.assertRaises(self.module.ConfigurationError):
+                    self.module.read_token_file(self.token)
+                self.assertEqual(self.requests, [])
+                self.assert_unchanged_without_backup()
 
     def test_api_checks_use_get_and_do_not_follow_redirects(self):
         response = Mock()

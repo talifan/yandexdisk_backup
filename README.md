@@ -74,15 +74,36 @@ Rclone пишет в stdout/stderr, включая неуспешные прох
 сообщают об успешном собственном OAuth-приложении. Это не гарантия состояния
 конкретного аккаунта или доступности каждого файла.
 
-Создайте своё приложение с **read-only** правами через
-[Яндекс OAuth](https://oauth.yandex.ru/). Порядок получения токена — в
-[официальной документации](https://yandex.ru/dev/id/doc/ru/tokens/debug-token).
-Сохраните token/ClientID и `expires_in` из ответа OAuth в owner-only файл вне repo:
+Создайте своё приложение «Для доступа к API или отладки» с **read-only** правами
+через [Яндекс OAuth](https://oauth.yandex.ru/client/new/): `cloud_api:disk.read` и
+`cloud_api:disk.info`. Redirect URI для этого типа приложения уже установлен:
+`https://oauth.yandex.ru/verification_code`.
+
+Для rclone 1.75.2 нужен **настоящий refresh token**, полученный обменом
+одноразового кода (`response_type=code`). Ручной `response_type=token` выдаёт
+только access token: HTTP-проверка с ним может пройти, но закреплённый Yandex
+backend rclone откажет ещё до обращения к Диску. Порядок обмена кода описан в
+[официальной документации](https://yandex.ru/dev/id/doc/ru/codes/code-url).
+
+Запустите helper с ClientID своего приложения и **новым** файлом вне repo:
+
+```sh
+python3 -I tools/get_oauth.py --client-id CLIENT_ID --output /private/new-oauth.env
+```
+
+Client secret и одноразовый код вводятся скрыто; helper напечатает ссылку, которую
+нужно открыть в браузере нужного аккаунта. Код действует 10 минут. Единственный
+POST направляется на `https://oauth.yandex.ru/token`, redirects запрещены.
+Секреты не печатаются и не передаются через argv. Полный ответ сохраняется как
+следующие значения в regular owner-only файл mode600; существующий файл или
+symlink не перезаписывается:
 
 ```dotenv
 YANDEX_ACCESS_TOKEN=<значение из OAuth>
 YANDEX_CLIENT_ID=<ClientID собственного приложения>
-YANDEX_EXPIRES_IN=<реальный expires_in, если выдан>
+YANDEX_REFRESH_TOKEN=<refresh_token из обмена кода>
+YANDEX_CLIENT_SECRET=<секрет того же собственного приложения>
+YANDEX_EXPIRES_IN=<реальный expires_in из ответа OAuth>
 ```
 
 Не помещайте токен в argv, чат или Git. Оба input-файла должны быть regular
@@ -125,8 +146,9 @@ sudo python3 -I /run/yandex-oauth-update/update_oauth.py --config /private/rclon
 
 Доступ проверяется повторно. Перед заменой создаётся приватная
 точная копия, сохраняются uid/gid и mode 600; меняется только выбранный remote.
-Старые refresh_token/client_secret не переносятся к новому приложению. Если время
-истечения не выдано, helper его не выдумывает; сервер остаётся источником истины.
+Старые refresh_token/client_secret не переносятся к новому приложению: сохраняются
+только новые значения из input-файла. Без refresh token, client secret или реального
+времени жизни helper отказывает до HTTP-запросов и изменения конфигурации.
 
 По окончании или при отказе удалите временную копию token и staged helper:
 

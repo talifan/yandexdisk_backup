@@ -48,7 +48,8 @@ def read_private(path: Path) -> tuple[bytes, os.stat_result]:
 
 def read_token_file(path: Path) -> dict[str, str]:
     content, _ = read_private(path)
-    allowed = {"YANDEX_ACCESS_TOKEN", "YANDEX_CLIENT_ID", "YANDEX_EXPIRES_IN"}
+    allowed = {"YANDEX_ACCESS_TOKEN", "YANDEX_CLIENT_ID", "YANDEX_EXPIRES_IN",
+               "YANDEX_REFRESH_TOKEN", "YANDEX_CLIENT_SECRET"}
     values = {}
     for line in content.decode("utf-8").splitlines():
         line = line.strip()
@@ -69,8 +70,15 @@ def read_token_file(path: Path) -> dict[str, str]:
         raise ConfigurationError("Missing or invalid access token")
     if not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", client_id):
         raise ConfigurationError("Missing or invalid owner application client ID")
+    # The pinned Yandex backend rejects access-only tokens before any API call.
+    # Require a genuine refresh token from this application's code exchange;
+    # never carry over the old application's credentials or invent a placeholder.
+    if not re.fullmatch(r"[!-~]{20,4096}", values.get("YANDEX_REFRESH_TOKEN", "")):
+        raise ConfigurationError("Missing or invalid refresh token from OAuth code exchange")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{16,4096}", values.get("YANDEX_CLIENT_SECRET", "")):
+        raise ConfigurationError("Missing or invalid owner application client secret")
     expiry = values.get("YANDEX_EXPIRES_IN")
-    if expiry is not None and (not expiry.isdigit() or not 1 <= int(expiry) <= 10 * 366 * 86400):
+    if expiry is None or not expiry.isdigit() or not 1 <= int(expiry) <= 10 * 366 * 86400:
         raise ConfigurationError("Invalid expires_in from OAuth response")
     return values
 
@@ -145,13 +153,13 @@ def update_configuration(config_path: Path, remote: str, values: dict[str, str],
         raise AccessError()
     if not apply:
         return {"ok": True, "read_only_api_checks": 3, "configuration_changed": False}
-    token = {"access_token": values["YANDEX_ACCESS_TOKEN"], "token_type": "OAuth"}
-    if "YANDEX_EXPIRES_IN" in values:
-        expires = datetime.now(timezone.utc) + timedelta(seconds=int(values["YANDEX_EXPIRES_IN"]))
-        token["expiry"] = expires.isoformat().replace("+00:00", "Z")
+    token = {"access_token": values["YANDEX_ACCESS_TOKEN"], "token_type": "OAuth",
+             "refresh_token": values["YANDEX_REFRESH_TOKEN"]}
+    expires = datetime.now(timezone.utc) + timedelta(seconds=int(values["YANDEX_EXPIRES_IN"]))
+    token["expiry"] = expires.isoformat().replace("+00:00", "Z")
     # A refresh token/secret belonging to the old application must not be reused.
     configuration[remote]["client_id"] = values["YANDEX_CLIENT_ID"]
-    configuration[remote].pop("client_secret", None)
+    configuration[remote]["client_secret"] = values["YANDEX_CLIENT_SECRET"]
     configuration[remote]["token"] = json.dumps(token, separators=(",", ":"))
     buffer = io.StringIO()
     configuration.write(buffer)
